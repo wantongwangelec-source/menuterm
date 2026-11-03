@@ -1,0 +1,325 @@
+import AppKit
+
+final class NotchWindowController: NSWindowController {
+    private let panel = NotchPanel()
+    private let terminalVC = TerminalViewController()
+    private let shapeView = NotchShapeView()
+    private let titleLabel = NSTextField(labelWithString: "MenuTerm")
+    private var terminalTopConstraint: NSLayoutConstraint?
+    private var isExpanded = false
+    private var geometry = NotchGeometry()
+    private var globalMouseMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var screenObserver: NSObjectProtocol?
+    private var settingsObserver: NSObjectProtocol?
+    private var sleepWakeObservers: [NSObjectProtocol] = []
+    private var resignActiveObserver: NSObjectProtocol?
+    private var isAnimating = false
+
+    init() {
+        super.init(window: panel)
+        setupViews()
+        setupPanelEvents()
+        setupMouseMonitors()
+        setupScreenObserver()
+        setupSettingsObserver()
+        setupSleepWakeObserver()
+        setupResignActiveObserver()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let monitor = globalMouseMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        if let monitor = localMouseMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        if let observer = screenObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = settingsObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        for observer in sleepWakeObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        if let observer = resignActiveObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    func showInitialWindow() {
+        panel.alphaValue = 1
+        hideImmediately()
+    }
+
+    override func showWindow(_ sender: Any?) {
+        showInitialWindow()
+    }
+
+    // MARK: - Setup
+
+    private func setupViews() {
+        // Start with a valid content size before installing the inset constraints.
+        // A zero-sized window used to create a negative terminal frame whose
+        // autoresizing mask could turn the insets into outward overflow.
+        panel.setFrame(geometry.expandedFrame, display: false)
+        let container = NSView(frame: NSRect(origin: .zero, size: panel.frame.size))
+        container.wantsLayer = true
+        if let layer = container.layer {
+            layer.shadowColor = NSColor.black.cgColor
+            layer.shadowOpacity = 0.5
+            layer.shadowRadius = 12
+            layer.shadowOffset = CGSize(width: 0, height: -4)
+        }
+        panel.contentView = container
+
+        // Background shape
+        shapeView.frame = container.bounds
+        shapeView.autoresizingMask = [.width, .height]
+        container.addSubview(shapeView)
+        syncShapeView()
+
+        // Terminal
+        terminalVC.view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(terminalVC.view)
+        let inset = NotchGeometry.contentInset
+        let topConstraint = terminalVC.view.topAnchor.constraint(
+            equalTo: container.topAnchor, constant: geometry.terminalTopInset)
+        terminalTopConstraint = topConstraint
+        NSLayoutConstraint.activate([
+            terminalVC.view.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: inset),
+            terminalVC.view.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -inset),
+            terminalVC.view.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -inset),
+            topConstraint
+        ])
+        container.layoutSubtreeIfNeeded()
+
+        terminalVC.onTitleChange = { _ in }
+        terminalVC.onDirectoryChange = { _ in }
+    }
+
+    private func setupPanelEvents() {
+        panel.onLeftMouseDown = { [weak self] event in
+            self?.handlePanelMouseDown(event)
+        }
+        panel.onScrollWheel = { [weak self] event in
+            self?.terminalVC.handleScrollWheel(with: event) ?? false
+        }
+    }
+
+    // MARK: - Mouse Monitoring
+
+    private func setupMouseMonitors() {
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handleOutsideMouseDown(event)
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handleOutsideMouseDown(event)
+            return event
+        }
+    }
+
+    private func setupScreenObserver() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenConfigurationChange()
+        }
+    }
+
+    private func setupSettingsObserver() {
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: .appSettingsDidChange,
+            object: AppSettings.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleSettingsChange()
+        }
+    }
+
+    private func setupSleepWakeObserver() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        let notifications: [Notification.Name] = [
+            NSWorkspace.screensDidSleepNotification,
+            NSWorkspace.screensDidWakeNotification
+        ]
+
+        sleepWakeObservers = notifications.map { name in
+            notificationCenter.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.hideImmediately()
+            }
+        }
+    }
+
+    private func setupResignActiveObserver() {
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.collapse()
+        }
+    }
+
+    private func handlePanelMouseDown(_ event: NSEvent) {
+        guard event.type == .leftMouseDown, !isExpanded else { return }
+        expand()
+    }
+
+    private func handleOutsideMouseDown(_ event: NSEvent) {
+        guard isExpanded else { return }
+        guard event.window !== panel else { return }
+
+        let screenPoint = screenLocation(for: event)
+        if !panel.frame.contains(screenPoint) {
+            collapse()
+        }
+    }
+
+    private func screenLocation(for event: NSEvent) -> NSPoint {
+        if let window = event.window {
+            return window.convertPoint(toScreen: event.locationInWindow)
+        }
+        return event.locationInWindow
+    }
+
+    private func handleScreenConfigurationChange() {
+        refreshGeometry()
+        panel.setFrame(geometry.expandedFrame, display: true)
+    }
+
+    private func handleSettingsChange() {
+        refreshGeometry()
+
+        let targetFrame = geometry.expandedFrame
+        if isExpanded {
+            panel.setFrame(targetFrame, display: true)
+        } else {
+            let hiddenFrame = NSRect(
+                x: targetFrame.origin.x,
+                y: targetFrame.origin.y + targetFrame.height,
+                width: targetFrame.width,
+                height: targetFrame.height
+            )
+            panel.setFrame(hiddenFrame, display: true)
+        }
+    }
+
+    // MARK: - Toggle
+
+    func toggle() {
+        if isExpanded && !panel.isVisible {
+            hideImmediately()
+        }
+        isExpanded ? collapse() : expand()
+    }
+
+    private func expand() {
+        guard !isExpanded, !isAnimating else { return }
+        isAnimating = true
+        isExpanded = true
+        refreshGeometry()
+
+        if !terminalVC.isShellRunning {
+            terminalVC.startShell()
+        }
+
+        let targetFrame = geometry.expandedFrame
+        // Start from above the screen (hidden)
+        let hiddenFrame = NSRect(x: targetFrame.origin.x, y: targetFrame.origin.y + targetFrame.height, width: targetFrame.width, height: targetFrame.height)
+        panel.setFrame(hiddenFrame, display: false)
+        panel.alphaValue = 1
+
+        // Order front before animation
+        panel.orderFront(nil)
+        NSApp.activate(ignoringOtherApps: false)
+        panel.makeKey()
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.3
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1) // easeOutExpo
+            self.panel.animator().setFrame(targetFrame, display: true)
+        }, completionHandler: { [weak self] in
+            guard let self, self.isExpanded else { return }
+            self.isAnimating = false
+            self.updateTerminalFrame()
+            self.terminalVC.focus()
+        })
+    }
+
+    private func collapse() {
+        guard isExpanded, !isAnimating else { return }
+        isAnimating = true
+        isExpanded = false
+
+        let currentFrame = panel.frame
+        let hiddenFrame = NSRect(x: currentFrame.origin.x, y: currentFrame.origin.y + currentFrame.height, width: currentFrame.width, height: currentFrame.height)
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.7, 0, 0.84, 0) // easeInExpo
+            self.panel.animator().setFrame(hiddenFrame, display: true)
+        }, completionHandler: { [weak self] in
+            guard let self, !self.isExpanded else { return }
+            self.isAnimating = false
+            self.panel.makeFirstResponder(nil)
+            self.panel.orderOut(nil)
+        })
+    }
+
+    private func hideImmediately() {
+        isExpanded = false
+        isAnimating = false
+        refreshGeometry()
+
+        let frame = geometry.expandedFrame
+        let hiddenFrame = NSRect(
+            x: frame.origin.x,
+            y: frame.origin.y + frame.height,
+            width: frame.width,
+            height: frame.height
+        )
+        panel.makeFirstResponder(nil)
+        panel.setFrame(hiddenFrame, display: false)
+        panel.orderOut(nil)
+    }
+
+    private func updateTerminalFrame() {
+        terminalTopConstraint?.constant = geometry.terminalTopInset
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    func restartShell() {
+        terminalVC.restartShell()
+        if !isExpanded { expand() }
+    }
+
+    private func refreshGeometry() {
+        if let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first {
+            geometry = NotchGeometry(screen: screen)
+        } else {
+            geometry = NotchGeometry()
+        }
+
+        syncShapeView()
+        updateTerminalFrame()
+    }
+
+    private func syncShapeView() {
+        shapeView.notchWidth = geometry.notchWidth
+        shapeView.notchHeight = geometry.notchHeight
+        shapeView.showsNotchCutout = false
+    }
+}
