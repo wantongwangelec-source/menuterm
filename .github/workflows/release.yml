@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build And Publish
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Downgrade Project Format For Xcode 15
+        run: |
+          perl -0pi -e 's/objectVersion = 77;/objectVersion = 60;/g; s/preferredProjectObjectVersion = 77;/preferredProjectObjectVersion = 60;/g' MenuTerm.xcodeproj/project.pbxproj
+          grep -nE "objectVersion|preferredProjectObjectVersion" MenuTerm.xcodeproj/project.pbxproj
+
+      - name: Resolve Release Version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="$(sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' project.yml | head -n 1)"
+            VERSION="v${VERSION}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ -z "${VERSION}" || "${VERSION}" == "v" ]]; then
+            echo "Release version is empty" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Release, ad-hoc signed)
+        run: |
+          xcodebuild build \
+            -project MenuTerm.xcodeproj \
+            -scheme MenuTerm \
+            -configuration Release \
+            -derivedDataPath build/CI \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGN_IDENTITY="-" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none"
+
+      - name: Locate App Bundle
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="build/CI/Build/Products/Release/MenuTerm.app"
+          if [[ ! -d "${APP_PATH}" ]]; then
+            echo "MenuTerm.app not found at ${APP_PATH}" >&2
+            exit 1
+          fi
+          echo "app_path=${APP_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify App Signature And Icon
+        run: ./scripts/verify-release-app.sh "${{ steps.locate.outputs.app_path }}"
+
+      - name: Test Icon Geometry And System Rendering
+        run: ./Tests/run-icon-tests.sh "${{ steps.locate.outputs.app_path }}"
+
+      - name: Package Assets
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="MenuTerm-${VERSION}-macos-adhoc.zip"
+
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${{ steps.locate.outputs.app_path }}" \
+            "dist/${ZIP_NAME}"
+
+          # Verify the archived app too: copying/packaging must preserve its seal.
+          VERIFY_DIR="$(mktemp -d)"
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
+          ditto -x -k "dist/${ZIP_NAME}" "$VERIFY_DIR"
+          ./scripts/verify-release-app.sh "$VERIFY_DIR/MenuTerm.app"
+
+          (cd dist && shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256")
+
+          echo "zip_path=dist/${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sha_path=dist/${ZIP_NAME}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            This build is ad-hoc signed, not Developer ID signed or notarized by Apple.
+            macOS may block the first launch; see the README's installation instructions.
+          files: |
+            ${{ steps.pkg.outputs.zip_path }}
+            ${{ steps.pkg.outputs.sha_path }}
